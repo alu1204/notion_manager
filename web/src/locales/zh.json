@@ -72,12 +72,13 @@
   "modal": {
     "add": {
       "title": "添加 Notion 账号",
-      "subtitle": "粘贴你的 token_v2 cookie，系统会自动获取账号信息。",
+      "subtitle": "粘贴你的 token_v2 cookie。系统会导入这个账号下的全部工作组，可在列表里分别打开。",
       "how_to": "获取方式：打开 notion.so → F12 → Application → Cookies → 复制 token_v2 的值",
       "placeholder": "粘贴 token_v2 值...",
       "success": "添加成功",
       "user": "用户:",
       "space": "空间:",
+      "workspaces": "已导入 {{count}} 个工作组，可在账号列表里分别打开。",
       "verifying": "正在验证..."
     },
     "register": {

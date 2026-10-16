@@ -72,12 +72,13 @@
   "modal": {
     "add": {
       "title": "Add Notion Account",
-      "subtitle": "Paste your token_v2 cookie, and the system will automatically retrieve account info.",
+      "subtitle": "Paste your token_v2 cookie. Every workspace on this account is imported and can be opened from the list.",
       "how_to": "How to get: Open notion.so → F12 → Application → Cookies → Copy token_v2 value",
       "placeholder": "Paste token_v2 value...",
       "success": "Added successfully",
       "user": "User:",
       "space": "Space:",
+      "workspaces": "Imported {{count}} workspaces. Open each one from the account list.",
       "verifying": "Verifying..."
     },
     "register": {

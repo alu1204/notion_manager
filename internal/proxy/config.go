@@ -125,8 +125,8 @@ func DefaultConfig() *Config {
 		},
 		Proxy: ProxyConfig{
 			NotionAPIBase:         "https://www.notion.so/api/v3",
-			ClientVersion:         "23.13.20260313.1423",
-			DefaultModel:          "opus-4.6",
+			ClientVersion:         "23.13.20261016.0235",
+			DefaultModel:          "opus-5",
 			EnableWebSearch:       boolPtr(true),
 			EnableWorkspaceSearch: boolPtr(false),
 			AskModeDefault:        boolPtr(false),
@@ -153,16 +153,7 @@ func DefaultConfig() *Config {
 			HistoryMemoryCap:   100,
 			DefaultConcurrency: 1,
 		},
-		ModelMap: map[string]string{
-			"opus-4.6":         "avocado-froyo-medium",
-			"sonnet-4.6":       "almond-croissant-low",
-			"haiku-4.5":        "anthropic-haiku-4.5",
-			"gpt-5.2":          "oatmeal-cookie",
-			"gpt-5.4":          "oval-kumquat-medium",
-			"gemini-2.5-flash": "vertex-gemini-2.5-flash",
-			"gemini-3-flash":   "gingerbread",
-			"minimax-m2.5":     "fireworks-minimax-m2.5",
-		},
+		ModelMap: builtinModelMap(),
 	}
 }
 

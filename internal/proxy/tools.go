@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -405,13 +406,6 @@ func isSuggestionMode(content string) bool {
 // rather than claiming the model has external tool access (which triggers refusal).
 func injectToolsIntoMessages(messages []ChatMessage, tools []Tool, model string, session *Session, toolChoice ...interface{}) []ChatMessage {
 	if len(tools) == 0 {
-		return messages
-	}
-
-	// Only Claude models (opus, sonnet, haiku) support format-based tool injection.
-	// Other models lack tested framing and may refuse or produce invalid output.
-	if detectModelFamily(model) != familyAnthropic {
-		log.Printf("[tool] model %s is not Claude — tools stripped, passing through as plain chat", model)
 		return messages
 	}
 
@@ -998,28 +992,262 @@ func buildSessionChainFollowUp(messages []ChatMessage, compactList string, cwd s
 // Tool call parsing: extract from NDJSON native tool_use or text
 // ──────────────────────────────────────────────────────────────────
 
-// nativeToolUseToOpenAI converts native Anthropic tool_use entries (from NDJSON) to OpenAI ToolCalls
-func nativeToolUseToOpenAI(entries []AgentValueEntry) []ToolCall {
-	var calls []ToolCall
-	for i, e := range entries {
-		if e.Type != "tool_use" || e.Name == "" {
+// nativeToolAccumulator keeps one tool_use per id. Notion sends callFunction
+// with an empty input first, then fills the real function and arguments in a
+// later cumulative event or agent-tool-result. Snapshotting the first sight
+// drops those arguments.
+type nativeToolAccumulator struct {
+	order []string
+	byID  map[string]AgentValueEntry
+}
+
+func (a *nativeToolAccumulator) upsert(entry AgentValueEntry) {
+	if a == nil || entry.ID == "" {
+		return
+	}
+	if entry.Type == "" {
+		entry.Type = "tool_use"
+	}
+	if a.byID == nil {
+		a.byID = map[string]AgentValueEntry{}
+	}
+	prev, ok := a.byID[entry.ID]
+	if !ok {
+		a.order = append(a.order, entry.ID)
+		a.byID[entry.ID] = entry
+		return
+	}
+	a.byID[entry.ID] = mergeNativeToolUse(prev, entry)
+}
+
+func (a *nativeToolAccumulator) mergeInput(id string, raw json.RawMessage) {
+	if a == nil || id == "" {
+		return
+	}
+	decoded := decodePatchJSON(raw)
+	if name, args, ok := unwrapCallFunctionInput(decoded); ok && !isNotionInternalToolName(name) {
+		a.upsert(AgentValueEntry{Type: "tool_use", ID: id, Name: name, Input: args})
+		return
+	}
+	prev, ok := a.byID[id]
+	if !ok || len(bytes.TrimSpace(decoded)) == 0 {
+		return
+	}
+	next := prev
+	next.Input = decoded
+	a.byID[id] = mergeNativeToolUse(prev, next)
+}
+
+func (a *nativeToolAccumulator) snapshot() []AgentValueEntry {
+	if a == nil || len(a.order) == 0 {
+		return nil
+	}
+	out := make([]AgentValueEntry, 0, len(a.order))
+	for _, id := range a.order {
+		if entry, ok := a.byID[id]; ok {
+			out = append(out, entry)
+		}
+	}
+	return out
+}
+
+func mergeNativeToolUse(prev, next AgentValueEntry) AgentValueEntry {
+	out := prev
+	if betterToolName(next.Name, prev.Name) {
+		out.Name = next.Name
+	}
+	if richerJSON(next.Input, prev.Input) {
+		out.Input = append(json.RawMessage(nil), next.Input...)
+	}
+	if next.Content != "" {
+		out.Content = next.Content
+	}
+	if next.Type != "" {
+		out.Type = next.Type
+	}
+	return out
+}
+
+func betterToolName(next, prev string) bool {
+	next = strings.TrimSpace(next)
+	if next == "" || isNotionInternalToolName(next) {
+		return false
+	}
+	if prev == "" || isNotionInternalToolName(prev) {
+		return true
+	}
+	return false
+}
+
+func richerJSON(next, prev json.RawMessage) bool {
+	next = bytes.TrimSpace(next)
+	prev = bytes.TrimSpace(prev)
+	if len(next) == 0 || string(next) == "null" || string(next) == "{}" {
+		return false
+	}
+	if len(prev) == 0 || string(prev) == "null" || string(prev) == "{}" {
+		return true
+	}
+	return len(next) > len(prev)
+}
+
+func decodePatchJSON(raw json.RawMessage) json.RawMessage {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 {
+		return nil
+	}
+	var asString string
+	if json.Unmarshal(raw, &asString) == nil {
+		trimmed := strings.TrimSpace(asString)
+		if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
+			return json.RawMessage(trimmed)
+		}
+	}
+	return raw
+}
+
+// isNotionInternalToolName reports Notion's own agent tools. Client tool
+// names such as Read or Bash stay visible. Dotted connection ids
+// (connections.search.search) stay inside the proxy.
+func isNotionInternalToolName(name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false
+	}
+	if strings.Contains(name, ".") {
+		return true
+	}
+	switch strings.ToLower(name) {
+	case "callfunction", "search":
+		return true
+	default:
+		return false
+	}
+}
+
+// unwrapCallFunctionInput reads {"function"|"name", "args"|"arguments"}.
+func unwrapCallFunctionInput(raw json.RawMessage) (string, json.RawMessage, bool) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || raw[0] != '{' {
+		return "", nil, false
+	}
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(raw, &obj) != nil {
+		return "", nil, false
+	}
+	var name string
+	for _, key := range []string{"function", "name"} {
+		if v, ok := obj[key]; ok && json.Unmarshal(v, &name) == nil && strings.TrimSpace(name) != "" {
+			name = strings.TrimSpace(name)
+			break
+		}
+		name = ""
+	}
+	if name == "" {
+		return "", nil, false
+	}
+	var args json.RawMessage
+	for _, key := range []string{"args", "arguments"} {
+		v, ok := obj[key]
+		if !ok {
 			continue
 		}
-		argsStr := "{}"
-		if len(e.Input) > 0 && json.Valid(e.Input) {
-			argsStr = string(e.Input)
+		v = bytes.TrimSpace(v)
+		if len(v) == 0 || string(v) == "null" {
+			continue
+		}
+		args = v
+		break
+	}
+	if len(args) == 0 {
+		args = json.RawMessage(`{}`)
+	}
+	return name, args, true
+}
+
+func noteAgentToolResult(acc *nativeToolAccumulator, line string) {
+	var evt struct {
+		ToolCallID string          `json:"toolCallId"`
+		Input      json.RawMessage `json:"input"`
+	}
+	if json.Unmarshal([]byte(line), &evt) != nil || evt.ToolCallID == "" {
+		return
+	}
+	name, args, ok := unwrapCallFunctionInput(evt.Input)
+	if !ok || isNotionInternalToolName(name) {
+		return
+	}
+	acc.upsert(AgentValueEntry{Type: "tool_use", ID: evt.ToolCallID, Name: name, Input: args})
+}
+
+func clientToolCallsFromNative(entries []AgentValueEntry) []ToolCall {
+	var calls []ToolCall
+	for _, entry := range entries {
+		if entry.Type != "" && entry.Type != "tool_use" {
+			continue
+		}
+		name := strings.TrimSpace(entry.Name)
+		args := entry.Input
+		if isNotionInternalToolName(name) || name == "" {
+			unwrapped, unwrappedArgs, ok := unwrapCallFunctionInput(entry.Input)
+			if !ok || isNotionInternalToolName(unwrapped) {
+				continue
+			}
+			name = unwrapped
+			args = unwrappedArgs
 		}
 		calls = append(calls, ToolCall{
-			ID:   e.ID,
+			ID:   entry.ID,
 			Type: "function",
 			Function: ToolCallFunction{
-				Name:      e.Name,
-				Arguments: argsStr,
+				Name:      name,
+				Arguments: toolArgumentsString(args),
 			},
 		})
-		_ = i
 	}
 	return calls
+}
+
+func withoutInternalToolCalls(calls []ToolCall) []ToolCall {
+	if len(calls) == 0 {
+		return nil
+	}
+	kept := make([]ToolCall, 0, len(calls))
+	for _, call := range calls {
+		if isNotionInternalToolName(call.Function.Name) {
+			continue
+		}
+		kept = append(kept, call)
+	}
+	return kept
+}
+
+func nativeCallsHaveArguments(calls []ToolCall) bool {
+	for _, call := range calls {
+		if toolCallHasArguments(call) {
+			return true
+		}
+	}
+	return false
+}
+
+func toolCallHasArguments(call ToolCall) bool {
+	raw := bytes.TrimSpace([]byte(call.Function.Arguments))
+	return len(raw) > 0 && string(raw) != "{}" && string(raw) != "null"
+}
+
+func toolArgumentsString(raw json.RawMessage) string {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || !json.Valid(raw) {
+		return "{}"
+	}
+	return string(raw)
+}
+
+// nativeToolUseToOpenAI converts native Anthropic tool_use entries (from NDJSON) to OpenAI ToolCalls.
+// Notion-internal names are unwrapped or dropped so clients never see callFunction.
+func nativeToolUseToOpenAI(entries []AgentValueEntry) []ToolCall {
+	return clientToolCallsFromNative(entries)
 }
 
 // Regex-based fallback parsers for text-based tool call output

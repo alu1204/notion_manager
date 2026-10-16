@@ -101,57 +101,114 @@ async function extract() {
       target: { tabId: tab.id },
       func: async () => {
         try {
-          // Call loadUserContent
-          const userResp = await fetch('/api/v3/loadUserContent', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            credentials: 'include',
-            body: '{}'
-          });
-          if (!userResp.ok) throw new Error(`API error: ${userResp.status}`);
-          const userData = await userResp.json();
-          const rm = userData.recordMap;
-
-          const getVal = (record) => record?.value?.value || record?.value;
-
-          const userId = Object.keys(rm.notion_user)[0];
-          const user = getVal(rm.notion_user[userId]);
-          const userRoot = getVal(rm.user_root[userId]);
-          const spacePointers = userRoot.space_view_pointers || [];
-
-          // Find best space (AI enabled, non-free preferred)
-          let bestSpace = null;
-          for (const ptr of spacePointers) {
-            const spaceData = getVal(rm.space?.[ptr.spaceId]);
-            if (spaceData) {
-              const aiEnabled = spaceData.settings?.enable_ai_feature !== false &&
-                                spaceData.settings?.disable_ai_feature !== true;
-              if (!bestSpace || (aiEnabled && spaceData.plan_type !== 'free')) {
-                bestSpace = { ...spaceData, spaceViewId: ptr.id };
+          const unwrap = (record) => {
+            let cur = record;
+            for (let i = 0; i < 6 && cur && typeof cur === 'object' && cur.value && typeof cur.value === 'object'; i++) {
+              cur = cur.value;
+            }
+            return cur && typeof cur === 'object' ? cur : {};
+          };
+          const post = async (path, body, extraHeaders) => {
+            const resp = await fetch(path, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', ...(extraHeaders || {}) },
+              credentials: 'include',
+              body: JSON.stringify(body ?? {})
+            });
+            if (!resp.ok) throw new Error(`API error: ${resp.status}`);
+            return resp.json();
+          };
+          const absorb = (into, payload) => {
+            const tables = payload?.recordMap || payload;
+            if (!tables || typeof tables !== 'object') return;
+            for (const key of ['notion_user', 'user_root', 'space', 'user_settings']) {
+              if (!tables[key] || typeof tables[key] !== 'object') continue;
+              into[key] = into[key] || {};
+              Object.assign(into[key], tables[key]);
+            }
+          };
+          const ingest = async (payload) => {
+            if (!payload || typeof payload !== 'object') return;
+            absorb(rm, payload);
+            if (payload.users && typeof payload.users === 'object') {
+              for (const recordMap of Object.values(payload.users)) absorb(rm, recordMap);
+            }
+            for (const [key, value] of Object.entries(payload)) {
+              if (['recordMap', 'users', 'fanoutData', 'spaceInaccessiblePages'].includes(key)) continue;
+              if (value && typeof value === 'object' && (value.user_root || value.notion_user || value.recordMap)) {
+                absorb(rm, value);
               }
             }
+            const fanout = Array.isArray(payload.fanoutData) ? payload.fanoutData.slice(0, 20) : [];
+            for (const item of fanout) {
+              try {
+                const next = await post('/api/v3/getSpacesFanout', item.request || {}, item.headers || {});
+                await ingest(next);
+              } catch (e) {}
+            }
+          };
+          const rm = {};
+          let loaded = false;
+          for (const endpoint of ['/api/v3/getSpacesInitial', '/api/v3/getSpaces', '/api/v3/loadUserContent']) {
+            try {
+              await ingest(await post(endpoint, {}));
+              if (rm.user_root && Object.keys(rm.user_root).length) {
+                loaded = true;
+                break;
+              }
+            } catch (e) {}
+          }
+          if (!loaded) throw new Error('API error: workspace catalog empty');
+
+          const userId = Object.keys(rm.notion_user || {})[0];
+          if (!userId) throw new Error('未找到可用空间');
+          const user = unwrap(rm.notion_user[userId]);
+          const userRoot = unwrap(rm.user_root?.[userId]);
+          const spacePointers = userRoot.space_view_pointers || [];
+          const missingIds = spacePointers
+            .map(ptr => ptr.spaceId)
+            .filter(id => id && !unwrap(rm.space?.[id]).name);
+          if (missingIds.length) {
+            try {
+              const pub = await post('/api/v3/getPublicSpaceData', { type: 'space-ids', spaceIds: missingIds });
+              rm.space = rm.space || {};
+              for (const item of pub.results || []) {
+                if (item?.id) rm.space[item.id] = { value: { value: item } };
+              }
+            } catch (e) {}
           }
 
+          let bestSpace = null;
+          let bestRank = -1;
+          for (const ptr of spacePointers) {
+            const spaceData = unwrap(rm.space?.[ptr.spaceId]);
+            const plan = spaceData.plan_type || spaceData.planType || '';
+            const aiOff = spaceData.settings?.enable_ai_feature === false || spaceData.settings?.disable_ai_feature === true;
+            const rank = (aiOff ? 0 : 2) + (plan && plan !== 'free' ? 1 : 0);
+            if (!bestSpace || rank > bestRank) {
+              bestSpace = { ...spaceData, id: spaceData.id || ptr.spaceId, plan_type: plan, spaceViewId: ptr.id };
+              bestRank = rank;
+            }
+          }
           if (!bestSpace) throw new Error('未找到可用空间');
 
-          const userSettings = getVal(rm.user_settings?.[userId]);
-          const settings = userSettings?.settings || {};
-          const timezone = settings.time_zone || Intl.DateTimeFormat().resolvedOptions().timeZone;
+          const userSettings = unwrap(rm.user_settings?.[userId]);
+          const settings = userSettings.settings || {};
+          const timezone = settings.time_zone || settings.timeZone || Intl.DateTimeFormat().resolvedOptions().timeZone;
 
-          // Get available models
-          const modelResp = await fetch('/api/v3/getAvailableModels', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            credentials: 'include',
-            body: JSON.stringify({ spaceId: bestSpace.id })
-          });
           let models = [];
-          if (modelResp.ok) {
-            const modelData = await modelResp.json();
-            models = (modelData.models || [])
-              .filter(m => !m.isDisabled)
-              .map(m => ({ name: m.modelMessage, id: m.model }));
-          }
+          try {
+            const modelData = await post('/api/v3/getAvailableModels', { spaceId: bestSpace.id });
+            const list = modelData.models || modelData.availableModels || modelData.available_models ||
+              (Array.isArray(modelData.data) ? modelData.data : modelData.data?.models) || [];
+            models = list
+              .filter(m => !(m.isDisabled || m.disabled || m.is_disabled))
+              .map(m => ({
+                name: m.modelMessage || m.displayName || m.display_name || m.name || m.title || m.label || m.model || m.id,
+                id: m.model || m.id || m.modelId || m.model_id
+              }))
+              .filter(m => m.id);
+          } catch (e) {}
 
           // Get client version — wait up to 5s for window.CONFIG to initialize
           let clientVersion = window.CONFIG?.version;

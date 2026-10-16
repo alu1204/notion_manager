@@ -10,6 +10,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"notion-manager/internal/notionapi"
 )
 
 // cryptoRandRead is a tiny indirection so we can stub out randomness in
@@ -63,9 +65,9 @@ func (c *Client) notionAPIHeaders() map[string]string {
 		version = c.clientVersion
 	}
 	headers := map[string]string{
-		"Origin":                       notionBase,
-		"Referer":                      notionBase + "/",
-		"x-notion-active-user-header":  cookies["notion_user_id"],
+		"Origin":                      notionBase,
+		"Referer":                     notionBase + "/",
+		"x-notion-active-user-header": cookies["notion_user_id"],
 	}
 	if version != "" {
 		headers["notion-client-version"] = version
@@ -197,33 +199,17 @@ func (c *Client) handleOnboarding() error {
 	}
 	userID := cookies["notion_user_id"]
 	userName := ""
-	{
-		body := bytes.NewReader([]byte(`{}`))
-		resp, raw, err := c.postJSON(notionAPIBase+"/getSpacesInitial", body, headers)
-		if err == nil && resp.StatusCode == 200 {
-			var data struct {
-				Users map[string]struct {
-					NotionUser map[string]struct {
-						Value map[string]interface{} `json:"value"`
-					} `json:"notion_user"`
-				} `json:"users"`
+	if cat, err := notionapi.FetchCatalog(c.notionPoster(headers)); err == nil {
+		for _, user := range cat.Users {
+			if user.ID == "" {
+				continue
 			}
-			if json.Unmarshal(raw, &data) == nil {
-				for uid, urec := range data.Users {
-					if userID == "" {
-						userID = uid
-					}
-					if nu, ok := urec.NotionUser[uid]; ok {
-						val := nu.Value
-						if inner, ok := val["value"].(map[string]interface{}); ok {
-							val = inner
-						}
-						if n, ok := val["name"].(string); ok && n != "" {
-							userName = n
-							break
-						}
-					}
-				}
+			if userID == "" {
+				userID = user.ID
+			}
+			if user.ID == userID && user.Name != "" {
+				userName = user.Name
+				break
 			}
 		}
 	}
@@ -383,7 +369,7 @@ func (c *Client) attachSpaceView(spaceID, viewID, userID string, headers map[str
 							"first_joined_space_time": now,
 							"joined":                  true,
 							"settings": map[string]interface{}{
-								"notify_email_digest":       true,
+								"notify_email_digest":      true,
 								"notify_home_digest_email": true,
 							},
 						},
@@ -501,30 +487,11 @@ func (c *Client) waitForWorkspaceReady(userID string, headers map[string]string)
 // space_views) is non-empty — i.e. Notion has actually linked at least one
 // workspace to this user.
 func userRootHasSpaceView(raw []byte, userID string) bool {
-	var rm struct {
-		RecordMap struct {
-			UserRoot map[string]json.RawMessage `json:"user_root"`
-		} `json:"recordMap"`
-	}
-	if err := json.Unmarshal(raw, &rm); err != nil {
+	cat, err := notionapi.ParseWorkspaceCatalog(raw)
+	if err != nil {
 		return false
 	}
-	rawUR, ok := rm.RecordMap.UserRoot[userID]
-	if !ok {
-		return false
-	}
-	var ur struct {
-		Value struct {
-			Value struct {
-				SpaceViewPointers []json.RawMessage `json:"space_view_pointers"`
-				SpaceViews        []json.RawMessage `json:"space_views"`
-			} `json:"value"`
-		} `json:"value"`
-	}
-	if err := json.Unmarshal(rawUR, &ur); err != nil {
-		return false
-	}
-	return len(ur.Value.Value.SpaceViewPointers) > 0 || len(ur.Value.Value.SpaceViews) > 0
+	return cat.CountForUser(userID) > 0
 }
 
 // ── Phase 5: extract session ────────────────────────────────────────────
@@ -536,30 +503,17 @@ func (c *Client) extractSession() (*NotionSession, error) {
 		cookies[ck.Name] = ck.Value
 	}
 
-	c.logf("calling loadUserContent")
-	resp, raw, err := c.postJSON(notionAPIBase+"/loadUserContent", bytes.NewReader([]byte(`{}`)), headers)
+	c.logf("calling workspace catalog")
+	cat, err := notionapi.FetchCatalog(c.notionPoster(headers))
 	if err != nil {
 		return nil, newErr("notion_load_user", "%v", err)
 	}
-	if resp.StatusCode != 200 {
-		return nil, newErr("notion_load_user", "HTTP %d", resp.StatusCode)
+	user, ok := pickCatalogUser(cat, cookies["notion_user_id"])
+	if !ok {
+		return nil, newErr("notion_load_user", "loadUserContent returned no usable space (user_root.space_views empty; createSpace likely never linked to user_root)")
 	}
-	var ud struct {
-		RecordMap struct {
-			NotionUser map[string]json.RawMessage `json:"notion_user"`
-			UserRoot   map[string]json.RawMessage `json:"user_root"`
-			Space      map[string]json.RawMessage `json:"space"`
-			UserSettings map[string]json.RawMessage `json:"user_settings"`
-		} `json:"recordMap"`
-	}
-	if err := json.Unmarshal(raw, &ud); err != nil {
-		return nil, newErr("notion_load_user", "JSON: %v", err)
-	}
-
-	userID, userName, userEmail := pickUserInfo(ud.RecordMap.NotionUser)
-
-	bestSpace, bestSVID := pickBestSpace(ud.RecordMap.Space, ud.RecordMap.UserRoot, userID)
-	if bestSpace == nil {
+	bestSpace, ok := notionapi.Select(user, "")
+	if !ok || bestSpace.SpaceID == "" {
 		// Pre-fix behavior fell back to c.createdSpace here, which let
 		// "ghost spaces" (created on Notion's side but never bound to
 		// user_root) sneak into accounts/ as zombie no-workspace JSONs.
@@ -570,27 +524,16 @@ func (c *Client) extractSession() (*NotionSession, error) {
 		return nil, newErr("notion_load_user", "loadUserContent returned no usable space (user_root.space_views empty; createSpace likely never linked to user_root)")
 	}
 
-	spaceID := stringOf(bestSpace["id"])
-	spaceName := stringOf(bestSpace["name"])
-	planType := stringOf(bestSpace["plan_type"])
-	if spaceID == "" {
-		return nil, newErr("notion_load_user", "best space record has no id")
-	}
-
-	timezone := "UTC"
-	if usRaw, ok := ud.RecordMap.UserSettings[userID]; ok {
-		var us struct {
-			Value struct {
-				Value struct {
-					Settings struct {
-						TimeZone string `json:"time_zone"`
-					} `json:"settings"`
-				} `json:"value"`
-			} `json:"value"`
-		}
-		if json.Unmarshal(usRaw, &us) == nil && us.Value.Value.Settings.TimeZone != "" {
-			timezone = us.Value.Value.Settings.TimeZone
-		}
+	userID := user.ID
+	userName := user.Name
+	userEmail := user.Email
+	spaceID := bestSpace.SpaceID
+	spaceName := bestSpace.Name
+	planType := bestSpace.PlanType
+	bestSVID := bestSpace.SpaceViewID
+	timezone := user.Timezone
+	if timezone == "" {
+		timezone = "UTC"
 	}
 
 	clientVersion := cookies["notion_client_version"]
@@ -627,106 +570,6 @@ func (c *Client) extractSession() (*NotionSession, error) {
 	}, nil
 }
 
-// pickUserInfo extracts the first notion_user record's id/name/email.
-func pickUserInfo(users map[string]json.RawMessage) (id, name, email string) {
-	for uid, raw := range users {
-		var rec struct {
-			Value struct {
-				Value map[string]interface{} `json:"value"`
-			} `json:"value"`
-		}
-		if json.Unmarshal(raw, &rec) == nil {
-			val := rec.Value.Value
-			if val == nil {
-				var fallback struct {
-					Value map[string]interface{} `json:"value"`
-				}
-				if json.Unmarshal(raw, &fallback) == nil {
-					val = fallback.Value
-				}
-			}
-			if val != nil {
-				name = stringOf(val["name"])
-				email = stringOf(val["email"])
-			}
-		}
-		id = uid
-		return
-	}
-	return "", "", ""
-}
-
-// pickBestSpace prefers a non-free space with AI enabled; falls back to the
-// first space with a non-empty id.
-func pickBestSpace(
-	spaces, userRoots map[string]json.RawMessage, userID string,
-) (map[string]interface{}, string) {
-	type ptr struct {
-		ID      string `json:"id"`
-		SpaceID string `json:"spaceId"`
-	}
-	var pointers []ptr
-	if rawUR, ok := userRoots[userID]; ok {
-		var ur struct {
-			Value struct {
-				Value struct {
-					SpaceViewPointers []ptr `json:"space_view_pointers"`
-				} `json:"value"`
-			} `json:"value"`
-		}
-		if json.Unmarshal(rawUR, &ur) == nil {
-			pointers = ur.Value.Value.SpaceViewPointers
-		}
-	}
-	loadSpace := func(sid string) map[string]interface{} {
-		raw, ok := spaces[sid]
-		if !ok {
-			return nil
-		}
-		var rec struct {
-			Value struct {
-				Value map[string]interface{} `json:"value"`
-			} `json:"value"`
-		}
-		if json.Unmarshal(raw, &rec) != nil || rec.Value.Value == nil {
-			return nil
-		}
-		return rec.Value.Value
-	}
-
-	var best map[string]interface{}
-	bestSVID := ""
-	for _, p := range pointers {
-		val := loadSpace(p.SpaceID)
-		if val == nil || stringOf(val["id"]) == "" {
-			continue
-		}
-		settings, _ := val["settings"].(map[string]interface{})
-		aiOK := true
-		if settings != nil {
-			if v, ok := settings["enable_ai_feature"].(bool); ok && !v {
-				aiOK = false
-			}
-			if v, ok := settings["disable_ai_feature"].(bool); ok && v {
-				aiOK = false
-			}
-		}
-		if best == nil || (aiOK && stringOf(val["plan_type"]) != "free") {
-			best = val
-			bestSVID = p.ID
-		}
-	}
-	if best != nil {
-		return best, bestSVID
-	}
-	for sid := range spaces {
-		if val := loadSpace(sid); val != nil && stringOf(val["id"]) != "" {
-			return val, ""
-		}
-	}
-	return nil, ""
-}
-
 // fetchModels calls getAvailableModels for the given space.
 func (c *Client) fetchModels(spaceID string, headers map[string]string) []map[string]interface{} {
 	if spaceID == "" {
@@ -737,31 +580,56 @@ func (c *Client) fetchModels(spaceID string, headers map[string]string) []map[st
 	if err != nil || resp.StatusCode != 200 {
 		return nil
 	}
-	var data struct {
-		Models []struct {
-			Model        string `json:"model"`
-			ModelMessage string `json:"modelMessage"`
-			IsDisabled   bool   `json:"isDisabled"`
-		} `json:"models"`
-	}
-	if err := json.Unmarshal(raw, &data); err != nil {
+	parsed, err := notionapi.ParseAvailableModels(raw)
+	if err != nil {
 		return nil
 	}
-	out := make([]map[string]interface{}, 0, len(data.Models))
-	for _, m := range data.Models {
-		if m.IsDisabled {
-			continue
-		}
-		name := m.ModelMessage
+	out := make([]map[string]interface{}, 0, len(parsed))
+	for _, m := range parsed {
+		name := m.Name
 		if name == "" {
-			name = m.Model
+			name = m.ID
 		}
 		out = append(out, map[string]interface{}{
 			"name": name,
-			"id":   m.Model,
+			"id":   m.ID,
 		})
 	}
 	return out
+}
+
+func (c *Client) notionPoster(headers map[string]string) notionapi.Poster {
+	return func(endpoint string, body []byte, extra map[string]string) (int, []byte, error) {
+		merged := make(map[string]string, len(headers)+len(extra))
+		for key, value := range headers {
+			merged[key] = value
+		}
+		for key, value := range extra {
+			merged[key] = value
+		}
+		resp, raw, err := c.postJSON(notionAPIBase+"/"+endpoint, bytes.NewReader(body), merged)
+		if err != nil {
+			return 0, raw, err
+		}
+		if resp == nil {
+			return 0, raw, nil
+		}
+		return resp.StatusCode, raw, nil
+	}
+}
+
+func pickCatalogUser(cat notionapi.Catalog, preferredID string) (notionapi.User, bool) {
+	if preferredID != "" {
+		for _, user := range cat.Users {
+			if user.ID == preferredID {
+				return user, true
+			}
+		}
+	}
+	if len(cat.Users) == 0 {
+		return notionapi.User{}, false
+	}
+	return cat.Users[0], true
 }
 
 // newUUID returns a random UUID v4 string.

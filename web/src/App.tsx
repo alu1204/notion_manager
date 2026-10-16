@@ -70,7 +70,7 @@ function AddAccountModal({ onClose, onSuccess }: { onClose: () => void; onSucces
   const [token, setToken] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
-  const [result, setResult] = useState<{ name: string; email: string; space: string; plan_type: string } | null>(null)
+  const [result, setResult] = useState<{ name: string; email: string; space: string; plan_type: string; workspaceCount: number } | null>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
 
   useEffect(() => { inputRef.current?.focus() }, [])
@@ -93,7 +93,7 @@ function AddAccountModal({ onClose, onSuccess }: { onClose: () => void; onSucces
       if (res.error) {
         setError(res.error)
       } else if (res.account) {
-        setResult(res.account)
+        setResult({ ...res.account, workspaceCount: res.workspaces?.length || 1 })
         setTimeout(() => {
           onSuccess()
           onClose()
@@ -137,6 +137,7 @@ function AddAccountModal({ onClose, onSuccess }: { onClose: () => void; onSucces
               <div className="space-y-0.5 text-text-secondary">
                 <div>{t('modal.add.user')} <span className="text-white">{result.name}</span> ({result.email})</div>
                 <div>{t('modal.add.space')} <span className="text-white">{result.space}</span> · {result.plan_type}</div>
+                {result.workspaceCount > 1 && <div>{t('modal.add.workspaces', { count: result.workspaceCount })}</div>}
               </div>
             </div>
           )}

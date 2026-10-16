@@ -225,6 +225,13 @@ export interface AddAccountResult {
     space: string
     plan_type: string
   }
+  workspaces?: {
+    name: string
+    email: string
+    space: string
+    space_id: string
+    plan_type: string
+  }[]
 }
 
 export async function addAccount(tokenV2: string): Promise<AddAccountResult> {

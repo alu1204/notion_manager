@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"notion-manager/internal/notionapi"
 )
 
 // AccountDTO is the safe admin/dashboard representation.
@@ -67,270 +69,207 @@ var (
 )
 
 // DiscoverAccountFromTokenWithOptions discovers an account while applying
-// optional exact selectors for multi-account browser sessions.
+// optional exact selectors for multi-account browser sessions. It returns
+// the single best workspace. Startup uses this seam and stays one account.
 func DiscoverAccountFromTokenWithOptions(tokenV2 string, options AccountDiscoveryOptions) (*Account, error) {
-	client := discoveryHTTPClient(AppConfig.APITimeoutDuration())
-
-	// Step 1: Call loadUserContent to get user/space info
-	req, err := http.NewRequest("POST", NotionAPIBase+"/loadUserContent", bytes.NewReader([]byte("{}")))
+	accounts, err := DiscoverAccountsFromTokenWithOptions(tokenV2, options)
 	if err != nil {
-		return nil, fmt.Errorf("create loadUserContent request: %w", err)
+		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", AppConfig.Browser.UserAgent)
-	activeUserID := strings.TrimSpace(options.ActiveUserID)
-	cookieHeader := "token_v2=" + tokenV2
-	if activeUserID != "" {
-		cookieHeader = accountCookieHeader(&Account{TokenV2: tokenV2, UserID: activeUserID})
-		req.Header.Set("x-notion-active-user-header", activeUserID)
+	best := preferredDiscoveredAccount(accounts, options.SpaceID)
+	if best == nil {
+		return nil, fmt.Errorf("no workspace found for this account")
 	}
-	req.Header.Set("Cookie", cookieHeader)
+	return best, nil
+}
 
-	resp, err := client.Do(req)
+// DiscoverAccountsFromTokenWithOptions lists every workspace that matches
+// the selectors. A pinned SpaceID returns only that workspace.
+func DiscoverAccountsFromTokenWithOptions(tokenV2 string, options AccountDiscoveryOptions) ([]*Account, error) {
+	client := discoveryHTTPClient(AppConfig.APITimeoutDuration())
+	var lastStatus int
+	var lastBody []byte
+	cat, err := notionapi.FetchCatalog(discoveryPoster(client, tokenV2, options, &lastStatus, &lastBody))
 	if err != nil {
 		return nil, fmt.Errorf("loadUserContent request failed: %w", err)
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("loadUserContent API error %d: %s", resp.StatusCode, truncate(string(body), 300))
+	if len(cat.Users) == 0 && lastStatus != 0 && lastStatus != http.StatusOK {
+		return nil, fmt.Errorf("loadUserContent API error %d: %s", lastStatus, truncate(string(lastBody), 300))
 	}
 
-	// Parse the response
-	var userData struct {
-		RecordMap struct {
-			NotionUser  map[string]json.RawMessage `json:"notion_user"`
-			UserRoot    map[string]json.RawMessage `json:"user_root"`
-			Space       map[string]json.RawMessage `json:"space"`
-			UserSetting map[string]json.RawMessage `json:"user_settings"`
-		} `json:"recordMap"`
-	}
-	if err := json.Unmarshal(body, &userData); err != nil {
-		return nil, fmt.Errorf("parse loadUserContent: %w", err)
-	}
-
-	type spaceViewPointer struct {
-		SpaceID string `json:"spaceId"`
-		ID      string `json:"id"`
-	}
-	spaceViewPointersForUser := func(userID string) []spaceViewPointer {
-		var pointers []spaceViewPointer
-		raw, ok := userData.RecordMap.UserRoot[userID]
-		if !ok {
-			return pointers
-		}
-		var ur struct {
-			Value struct {
-				Value *struct {
-					SpaceViewPointers []spaceViewPointer `json:"space_view_pointers"`
-				} `json:"value"`
-				SpaceViewPointers []spaceViewPointer `json:"space_view_pointers"`
-			} `json:"value"`
-		}
-		if err := json.Unmarshal(raw, &ur); err != nil {
-			return pointers
-		}
-		if ur.Value.Value != nil {
-			return ur.Value.Value.SpaceViewPointers
-		}
-		return ur.Value.SpaceViewPointers
-	}
-
-	// Extract user ID and info
+	activeUserID := strings.TrimSpace(options.ActiveUserID)
 	expectedEmail := strings.TrimSpace(options.ExpectedEmail)
 	requestedSpaceID := strings.TrimSpace(options.SpaceID)
-	var userID, userName, userEmail string
-	for id, raw := range userData.RecordMap.NotionUser {
-		if activeUserID != "" && id != activeUserID {
+	var matched []notionapi.User
+	for _, user := range cat.Users {
+		if user.ID == "" {
 			continue
 		}
-		var u struct {
-			Value struct {
-				Value *struct {
-					Name  string `json:"name"`
-					Email string `json:"email"`
-				} `json:"value"`
-				Name  string `json:"name"`
-				Email string `json:"email"`
-			} `json:"value"`
-		}
-		if err := json.Unmarshal(raw, &u); err != nil {
+		if activeUserID != "" && user.ID != activeUserID {
 			continue
 		}
-		candidateName := u.Value.Name
-		candidateEmail := u.Value.Email
-		if u.Value.Value != nil {
-			candidateName = u.Value.Value.Name
-			candidateEmail = u.Value.Value.Email
-		}
-		if expectedEmail != "" && !strings.EqualFold(candidateEmail, expectedEmail) {
+		if expectedEmail != "" && !strings.EqualFold(user.Email, expectedEmail) {
 			continue
 		}
-		if requestedSpaceID != "" {
-			matchedSpace := false
-			for _, ptr := range spaceViewPointersForUser(id) {
-				if ptr.SpaceID == requestedSpaceID {
-					matchedSpace = true
-					break
-				}
-			}
-			if !matchedSpace {
-				continue
-			}
+		if requestedSpaceID != "" && !userHasSpace(user, requestedSpaceID) {
+			continue
 		}
-		userID = id
-		userName = candidateName
-		userEmail = candidateEmail
-		break
+		matched = append(matched, user)
 	}
-	if userID == "" {
+	if len(matched) == 0 {
 		if activeUserID != "" || expectedEmail != "" || requestedSpaceID != "" {
 			return nil, fmt.Errorf("no user matched the configured Notion account selectors")
 		}
 		return nil, fmt.Errorf("no user found in loadUserContent response")
 	}
 
-	// Extract space view pointers from user_root
-	spaceViewPointers := spaceViewPointersForUser(userID)
-
-	// Find the best space (AI enabled, non-free preferred)
-	type spaceInfo struct {
-		ID          string
-		Name        string
-		PlanType    string
-		SpaceViewID string
-		AIEnabled   bool
-	}
-	var bestSpace *spaceInfo
-	for _, ptr := range spaceViewPointers {
-		if requestedSpaceID != "" && ptr.SpaceID != requestedSpaceID {
-			continue
-		}
-		raw, ok := userData.RecordMap.Space[ptr.SpaceID]
-		if !ok {
-			continue
-		}
-		var s struct {
-			Value struct {
-				Value *struct {
-					ID       string `json:"id"`
-					Name     string `json:"name"`
-					PlanType string `json:"plan_type"`
-					Settings struct {
-						EnableAIFeature  *bool `json:"enable_ai_feature"`
-						DisableAIFeature *bool `json:"disable_ai_feature"`
-					} `json:"settings"`
-				} `json:"value"`
-				ID       string `json:"id"`
-				Name     string `json:"name"`
-				PlanType string `json:"plan_type"`
-				Settings struct {
-					EnableAIFeature  *bool `json:"enable_ai_feature"`
-					DisableAIFeature *bool `json:"disable_ai_feature"`
-				} `json:"settings"`
-			} `json:"value"`
-		}
-		if err := json.Unmarshal(raw, &s); err != nil {
-			continue
-		}
-		var si spaceInfo
-		si.SpaceViewID = ptr.ID
-		if s.Value.Value != nil {
-			si.ID = s.Value.Value.ID
-			si.Name = s.Value.Value.Name
-			si.PlanType = s.Value.Value.PlanType
-			aiOff := s.Value.Value.Settings.DisableAIFeature != nil && *s.Value.Value.Settings.DisableAIFeature
-			si.AIEnabled = !aiOff
-		} else {
-			si.ID = s.Value.ID
-			si.Name = s.Value.Name
-			si.PlanType = s.Value.PlanType
-			aiOff := s.Value.Settings.DisableAIFeature != nil && *s.Value.Settings.DisableAIFeature
-			si.AIEnabled = !aiOff
-		}
-		if si.ID == "" {
-			si.ID = ptr.SpaceID
-		}
+	now := time.Now()
+	browserID := generateUUIDv4()
+	deviceID := generateUUIDv4()
+	var accounts []*Account
+	for _, user := range matched {
+		spaces := user.Workspaces
 		if requestedSpaceID != "" {
-			if si.ID == requestedSpaceID {
-				bestSpace = &si
+			var pinned []notionapi.Workspace
+			for _, ws := range spaces {
+				if ws.SpaceID == requestedSpaceID {
+					pinned = append(pinned, ws)
+				}
 			}
-			break
+			if len(pinned) == 0 {
+				return nil, fmt.Errorf("requested NOTION_SPACE_ID was not found for the active account")
+			}
+			spaces = pinned
 		}
-		if bestSpace == nil || (si.AIEnabled && si.PlanType != "free") {
-			bestSpace = &si
+		if len(spaces) == 0 {
+			continue
+		}
+		timezone := user.Timezone
+		if timezone == "" {
+			timezone = "UTC"
+		}
+		checkedAt := now
+		for _, ws := range spaces {
+			acc := &Account{
+				TokenV2:            tokenV2,
+				UserID:             user.ID,
+				UserName:           user.Name,
+				UserEmail:          user.Email,
+				SpaceID:            ws.SpaceID,
+				SpaceName:          ws.Name,
+				SpaceViewID:        ws.SpaceViewID,
+				PlanType:           ws.PlanType,
+				Timezone:           timezone,
+				ClientVersion:      DefaultClientVersion,
+				BrowserID:          browserID,
+				DeviceID:           deviceID,
+				SpaceCount:         len(user.Workspaces),
+				WorkspaceCheckedAt: &checkedAt,
+			}
+			acc.EnsureAccountID()
+			models, modelErr := discoveryFetchModels(acc)
+			if modelErr != nil {
+				log.Printf("[add-account] model fetch failed (non-fatal): %v", modelErr)
+			} else {
+				acc.setModels(models)
+			}
+			quota, quotaErr := discoveryCheckQuota(acc)
+			if quotaErr != nil {
+				log.Printf("[add-account] quota check failed (non-fatal): %v", quotaErr)
+			} else {
+				checked := time.Now()
+				acc.setQuotaInfo(quota, &checked)
+			}
+			accounts = append(accounts, acc)
 		}
 	}
-	if bestSpace == nil {
+	if len(accounts) == 0 {
 		if requestedSpaceID != "" {
 			return nil, fmt.Errorf("requested NOTION_SPACE_ID was not found for the active account")
 		}
 		return nil, fmt.Errorf("no workspace found for this account")
 	}
+	return accounts, nil
+}
 
-	// Extract timezone from user_settings
-	timezone := "UTC"
-	if raw, ok := userData.RecordMap.UserSetting[userID]; ok {
-		var us struct {
-			Value struct {
-				Value *struct {
-					Settings struct {
-						TimeZone string `json:"time_zone"`
-					} `json:"settings"`
-				} `json:"value"`
-				Settings struct {
-					TimeZone string `json:"time_zone"`
-				} `json:"settings"`
-			} `json:"value"`
+func discoveryPoster(client *http.Client, tokenV2 string, options AccountDiscoveryOptions, lastStatus *int, lastBody *[]byte) notionapi.Poster {
+	return func(endpoint string, body []byte, extra map[string]string) (int, []byte, error) {
+		req, err := http.NewRequest("POST", NotionAPIBase+"/"+endpoint, bytes.NewReader(body))
+		if err != nil {
+			return 0, nil, fmt.Errorf("create loadUserContent request: %w", err)
 		}
-		if err := json.Unmarshal(raw, &us); err == nil {
-			if us.Value.Value != nil && us.Value.Value.Settings.TimeZone != "" {
-				timezone = us.Value.Value.Settings.TimeZone
-			} else if us.Value.Settings.TimeZone != "" {
-				timezone = us.Value.Settings.TimeZone
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("User-Agent", AppConfig.Browser.UserAgent)
+		activeUserID := strings.TrimSpace(options.ActiveUserID)
+		cookieHeader := "token_v2=" + tokenV2
+		if activeUserID != "" {
+			cookieHeader = accountCookieHeader(&Account{TokenV2: tokenV2, UserID: activeUserID})
+			req.Header.Set("x-notion-active-user-header", activeUserID)
+		}
+		req.Header.Set("Cookie", cookieHeader)
+		for key, value := range extra {
+			if key != "" && value != "" {
+				req.Header.Set(key, value)
+			}
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return 0, nil, err
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusOK && lastStatus != nil {
+			*lastStatus = resp.StatusCode
+			if lastBody != nil {
+				*lastBody = raw
+			}
+		}
+		return resp.StatusCode, raw, nil
+	}
+}
+
+func userHasSpace(user notionapi.User, spaceID string) bool {
+	for _, ws := range user.Workspaces {
+		if ws.SpaceID == spaceID {
+			return true
+		}
+	}
+	return false
+}
+
+func preferredDiscoveredAccount(accounts []*Account, requestedSpaceID string) *Account {
+	if len(accounts) == 0 {
+		return nil
+	}
+	requestedSpaceID = strings.TrimSpace(requestedSpaceID)
+	if requestedSpaceID != "" {
+		for _, acc := range accounts {
+			if acc.SpaceID == requestedSpaceID {
+				return acc
 			}
 		}
 	}
-
-	browserID := generateUUIDv4()
-	deviceID := generateUUIDv4()
-
-	acc := &Account{
-		TokenV2:       tokenV2,
-		UserID:        userID,
-		UserName:      userName,
-		UserEmail:     userEmail,
-		SpaceID:       bestSpace.ID,
-		SpaceName:     bestSpace.Name,
-		SpaceViewID:   bestSpace.SpaceViewID,
-		PlanType:      bestSpace.PlanType,
-		Timezone:      timezone,
-		ClientVersion: DefaultClientVersion,
-		BrowserID:     browserID,
-		DeviceID:      deviceID,
+	best := accounts[0]
+	bestRank := discoveredWorkspaceRank(best)
+	for _, acc := range accounts[1:] {
+		if rank := discoveredWorkspaceRank(acc); rank > bestRank {
+			best = acc
+			bestRank = rank
+		}
 	}
+	return best
+}
 
-	acc.EnsureAccountID()
-
-	// Step 2: Fetch available models
-	models, err := discoveryFetchModels(acc)
-	if err != nil {
-		log.Printf("[add-account] model fetch failed (non-fatal): %v", err)
-	} else {
-		acc.setModels(models)
+func discoveredWorkspaceRank(acc *Account) int {
+	if acc == nil {
+		return 0
 	}
-
-	// Step 3: Check quota
-	quota, err := discoveryCheckQuota(acc)
-	if err != nil {
-		log.Printf("[add-account] quota check failed (non-fatal): %v", err)
-	} else {
-		now := time.Now()
-		acc.setQuotaInfo(quota, &now)
+	rank := 2
+	if acc.PlanType != "" && !strings.EqualFold(acc.PlanType, "free") {
+		rank++
 	}
-
-	return acc, nil
+	return rank
 }
 
 // SaveAccountToFile writes an Account to a JSON file in the accounts directory.
@@ -456,6 +395,10 @@ func SaveAccountToFile(acc *Account, dir string) (string, error) {
 	}
 	if quota.CheckedAt != nil {
 		data["quota_checked_at"] = quota.CheckedAt.Format(time.RFC3339)
+	}
+	if acc.WorkspaceCheckedAt != nil {
+		data["space_count"] = acc.SpaceCount
+		data["workspace_checked_at"] = acc.WorkspaceCheckedAt.Format(time.RFC3339)
 	}
 	data["extracted_at"] = time.Now().Format(time.RFC3339)
 
@@ -594,6 +537,7 @@ func HandleAddAccount(pool *AccountPool, accountsDir string, auth *DashboardAuth
 		var body struct {
 			TokenV2      string `json:"token_v2"`
 			NotionUserID string `json:"notion_user_id"`
+			SpaceID      string `json:"space_id"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
@@ -607,9 +551,9 @@ func HandleAddAccount(pool *AccountPool, accountsDir string, auth *DashboardAuth
 
 		log.Printf("[add-account] discovering account from token_v2 (%d chars)...", len(tokenV2))
 
-		// Discover account info
-		acc, err := DiscoverAccountFromTokenWithOptions(tokenV2, AccountDiscoveryOptions{
+		accounts, err := DiscoverAccountsFromTokenWithOptions(tokenV2, AccountDiscoveryOptions{
 			ActiveUserID: strings.TrimSpace(body.NotionUserID),
+			SpaceID:      strings.TrimSpace(body.SpaceID),
 		})
 		if err != nil {
 			log.Printf("[add-account] discovery failed: %v", err)
@@ -620,32 +564,101 @@ func HandleAddAccount(pool *AccountPool, accountsDir string, auth *DashboardAuth
 			return
 		}
 
-		// Save to file
-		filename, err := SaveAccountToFile(acc, accountsDir)
-		if err != nil {
-			log.Printf("[add-account] save failed: %v", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			json.NewEncoder(w).Encode(map[string]string{
-				"error": fmt.Sprintf("Failed to save account: %v", err),
-			})
-			return
+		best := preferredDiscoveredAccount(accounts, body.SpaceID)
+		saved := make([]map[string]string, 0, len(accounts))
+		bestFilename := ""
+		for _, acc := range accounts {
+			filename, saveErr := SaveAccountToFile(acc, accountsDir)
+			if saveErr != nil {
+				log.Printf("[add-account] save failed: %v", saveErr)
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]string{
+					"error": fmt.Sprintf("Failed to save account: %v", saveErr),
+				})
+				return
+			}
+			pool.AddAccount(acc)
+			if best != nil && acc.AccountID == best.AccountID {
+				bestFilename = filename
+			}
+			saved = append(saved, workspacePayload(acc, filename))
+			log.Printf("[add-account] success: %s (%s) space=%s → %s", acc.UserName, acc.UserEmail, acc.SpaceName, filename)
 		}
-
-		// Hot-load into pool
-		pool.AddAccount(acc)
-
-		log.Printf("[add-account] success: %s (%s) → %s", acc.UserName, acc.UserEmail, filename)
+		if bestFilename == "" && len(saved) > 0 {
+			bestFilename = saved[0]["filename"]
+		}
 
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":   "ok",
-			"filename": filename,
+			"filename": bestFilename,
 			"account": map[string]string{
-				"name":      acc.UserName,
-				"email":     acc.UserEmail,
-				"space":     acc.SpaceName,
-				"plan_type": acc.PlanType,
+				"name":      best.UserName,
+				"email":     best.UserEmail,
+				"space":     best.SpaceName,
+				"plan_type": best.PlanType,
 			},
+			"workspaces": saved,
 		})
+	}
+}
+
+// HandleListWorkspaces lists the workspaces behind a token without saving them.
+func HandleListWorkspaces(auth *DashboardAuth) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != "POST" {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		if auth.HasAdminPassword() && !auth.ValidateSession(r) {
+			http.Error(w, `{"error":"unauthorized, dashboard login required"}`, http.StatusUnauthorized)
+			return
+		}
+		var body struct {
+			TokenV2      string `json:"token_v2"`
+			NotionUserID string `json:"notion_user_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
+			return
+		}
+		tokenV2 := strings.TrimSpace(body.TokenV2)
+		if tokenV2 == "" {
+			http.Error(w, `{"error":"token_v2 is required"}`, http.StatusBadRequest)
+			return
+		}
+		accounts, err := DiscoverAccountsFromTokenWithOptions(tokenV2, AccountDiscoveryOptions{
+			ActiveUserID: strings.TrimSpace(body.NotionUserID),
+		})
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{
+				"error": fmt.Sprintf("Failed to list workspaces: %v", err),
+			})
+			return
+		}
+		workspaces := make([]map[string]string, 0, len(accounts))
+		for _, acc := range accounts {
+			workspaces = append(workspaces, workspacePayload(acc, ""))
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":     "ok",
+			"workspaces": workspaces,
+		})
+	}
+}
+
+func workspacePayload(acc *Account, filename string) map[string]string {
+	if acc == nil {
+		return map[string]string{}
+	}
+	return map[string]string{
+		"name":      acc.UserName,
+		"email":     acc.UserEmail,
+		"space":     acc.SpaceName,
+		"space_id":  acc.SpaceID,
+		"plan_type": acc.PlanType,
+		"filename":  filename,
 	}
 }
 

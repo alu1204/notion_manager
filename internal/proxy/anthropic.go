@@ -501,13 +501,21 @@ type preparedToolBridgeResponse struct {
 func prepareToolBridgeResponse(content string, nativeToolUses []AgentValueEntry) preparedToolBridgeResponse {
 	prepared := preparedToolBridgeResponse{}
 
-	if len(nativeToolUses) > 0 {
-		prepared.ToolCalls = nativeToolUseToOpenAI(nativeToolUses)
-		prepared.HasCalls = len(prepared.ToolCalls) > 0
+	// A native callFunction with an empty input is not a client tool. Prefer
+	// the text JSON the bridge asked the model to emit when the native entry
+	// has no real arguments. Once Notion fills function+args, those win.
+	nativeCalls := clientToolCallsFromNative(nativeToolUses)
+	textCalls, textRemaining, textHas := parseToolCalls(content)
+	textCalls = withoutInternalToolCalls(textCalls)
+	textHas = len(textCalls) > 0
+	if len(nativeCalls) > 0 && (nativeCallsHaveArguments(nativeCalls) || !textHas) {
+		prepared.ToolCalls = nativeCalls
+		prepared.HasCalls = true
 		prepared.Remaining = content
-	}
-	if !prepared.HasCalls {
-		prepared.ToolCalls, prepared.Remaining, prepared.HasCalls = parseToolCalls(content)
+	} else if textHas {
+		prepared.ToolCalls = textCalls
+		prepared.Remaining = textRemaining
+		prepared.HasCalls = true
 	}
 
 	if prepared.HasCalls {
@@ -1920,33 +1928,9 @@ func handleAnthropicStream(w http.ResponseWriter, acc *Account, messages []ChatM
 
 		// Send tool_use blocks
 		if hasCalls {
-			for _, tc := range toolCalls {
-				sendAnthropicSSE(w, flusher, "content_block_start", map[string]interface{}{
-					"type":  "content_block_start",
-					"index": blockIndex,
-					"content_block": map[string]interface{}{
-						"type":  "tool_use",
-						"id":    tc.ID,
-						"name":  tc.Function.Name,
-						"input": map[string]interface{}{},
-					},
-				})
-				sendAnthropicSSE(w, flusher, "content_block_delta", map[string]interface{}{
-					"type":  "content_block_delta",
-					"index": blockIndex,
-					"delta": map[string]interface{}{"type": "input_json_delta", "partial_json": tc.Function.Arguments},
-				})
-				sendAnthropicSSE(w, flusher, "content_block_stop", map[string]interface{}{
-					"type": "content_block_stop", "index": blockIndex,
-				})
-				loggedContentBlocks = append(loggedContentBlocks, AnthropicContentBlock{
-					Type:  "tool_use",
-					ID:    tc.ID,
-					Name:  tc.Function.Name,
-					Input: json.RawMessage(tc.Function.Arguments),
-				})
-				blockIndex++
-			}
+			var logged []AnthropicContentBlock
+			blockIndex, logged = emitAnthropicToolUses(w, flusher, blockIndex, toolCalls)
+			loggedContentBlocks = append(loggedContentBlocks, logged...)
 		}
 
 		stopReason := "end_turn"
@@ -2175,6 +2159,40 @@ func handleAnthropicNonStream(w http.ResponseWriter, acc *Account, messages []Ch
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 	return nil
+}
+
+// emitAnthropicToolUses writes one tool_use block per call. Streaming clients
+// (and the OpenAI chat transcoder) read the name and input_json_delta here.
+func emitAnthropicToolUses(w http.ResponseWriter, flusher http.Flusher, blockIndex int, toolCalls []ToolCall) (int, []AnthropicContentBlock) {
+	logged := make([]AnthropicContentBlock, 0, len(toolCalls))
+	for _, tc := range toolCalls {
+		sendAnthropicSSE(w, flusher, "content_block_start", map[string]interface{}{
+			"type":  "content_block_start",
+			"index": blockIndex,
+			"content_block": map[string]interface{}{
+				"type":  "tool_use",
+				"id":    tc.ID,
+				"name":  tc.Function.Name,
+				"input": map[string]interface{}{},
+			},
+		})
+		sendAnthropicSSE(w, flusher, "content_block_delta", map[string]interface{}{
+			"type":  "content_block_delta",
+			"index": blockIndex,
+			"delta": map[string]interface{}{"type": "input_json_delta", "partial_json": tc.Function.Arguments},
+		})
+		sendAnthropicSSE(w, flusher, "content_block_stop", map[string]interface{}{
+			"type": "content_block_stop", "index": blockIndex,
+		})
+		logged = append(logged, AnthropicContentBlock{
+			Type:  "tool_use",
+			ID:    tc.ID,
+			Name:  tc.Function.Name,
+			Input: json.RawMessage(tc.Function.Arguments),
+		})
+		blockIndex++
+	}
+	return blockIndex, logged
 }
 
 func sendAnthropicSSE(w http.ResponseWriter, flusher http.Flusher, eventType string, data interface{}) {
