@@ -202,6 +202,8 @@ func newMux(pool *proxy.AccountPool, accountsDir string, apiKey string, dashAuth
 	// Admin API endpoints
 	mux.HandleFunc("/admin/accounts", proxy.HandleAdminAccounts(pool, dashAuth))
 	mux.HandleFunc("/admin/accounts/add", proxy.HandleAddAccount(pool, accountsDir, dashAuth))
+	mux.HandleFunc("/admin/accounts/email/start", proxy.HandleEmailLoginStart(dashAuth))
+	mux.HandleFunc("/admin/accounts/email/verify", proxy.HandleEmailLoginVerify(pool, accountsDir, dashAuth))
 	mux.HandleFunc("/admin/accounts/workspaces", proxy.HandleListWorkspaces(dashAuth))
 	mux.HandleFunc("/admin/accounts/delete", proxy.HandleDeleteAccount(pool, accountsDir, dashAuth))
 	mux.HandleFunc("/admin/models", proxy.HandleAdminModels(pool, dashAuth))

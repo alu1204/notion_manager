@@ -1,7 +1,8 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 import type { DashboardData, AccountInfo, AccountSummary, RefreshStatus, TokenStats } from './types'
-import { fetchDashboardData, openProxy, openBestProxy, checkAuth, login, logout, triggerRefresh, fetchSettings, updateSettings, addAccount, fetchTokenStats } from './api'
+import { fetchDashboardData, openProxy, openBestProxy, checkAuth, login, logout, triggerRefresh, fetchSettings, updateSettings, addAccount, fetchTokenStats, startEmailLogin, verifyEmailLogin } from './api'
+import type { EmailWorkspace } from './api'
 import type { SearchSettings } from './api'
 import { fmt, formatTokens, getQuotaStatusByUsage, getQuotaPct, avatarColor, avatarLetter, formatCheckedAt, formatTimestampMs, providerDisplay } from './utils'
 import { AccountMenu } from './components/AccountMenu'
@@ -67,19 +68,38 @@ const IconTrash = () => (
 
 function AddAccountModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: () => void }) {
   const { t } = useTranslation()
+  const [mode, setMode] = useState<'token' | 'email'>('token')
   const [token, setToken] = useState('')
+  const [email, setEmail] = useState('')
+  const [code, setCode] = useState('')
+  const [spaceName, setSpaceName] = useState('')
+  const [sessionId, setSessionId] = useState('')
+  const [sentHint, setSentHint] = useState('')
+  const [passwordHint, setPasswordHint] = useState(false)
+  const [challenge, setChallenge] = useState('')
+  const [choices, setChoices] = useState<EmailWorkspace[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [result, setResult] = useState<{ name: string; email: string; space: string; plan_type: string; workspaceCount: number } | null>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
+  const emailRef = useRef<HTMLInputElement>(null)
 
-  useEffect(() => { inputRef.current?.focus() }, [])
+  useEffect(() => { mode === 'token' ? inputRef.current?.focus() : emailRef.current?.focus() }, [mode])
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
   }, [onClose])
+
+  const finish = (account: { name: string; email: string; space: string; plan_type: string }, workspaceCount: number) => {
+    setResult({ ...account, workspaceCount })
+    setChoices([])
+    setTimeout(() => {
+      onSuccess()
+      onClose()
+    }, 1500)
+  }
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -93,11 +113,58 @@ function AddAccountModal({ onClose, onSuccess }: { onClose: () => void; onSucces
       if (res.error) {
         setError(res.error)
       } else if (res.account) {
-        setResult({ ...res.account, workspaceCount: res.workspaces?.length || 1 })
-        setTimeout(() => {
-          onSuccess()
-          onClose()
-        }, 1500)
+        finish(res.account, res.workspaces?.length || 1)
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('modal.register.submit_failed'))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleSendCode = async (e: React.FormEvent) => {
+    e.preventDefault()
+    const trimmed = email.trim()
+    if (!trimmed) return
+    setLoading(true)
+    setError('')
+    setChoices([])
+    try {
+      const res = await startEmailLogin(trimmed)
+      if (res.error || !res.session_id) {
+        setError(res.error || t('modal.register.submit_failed'))
+      } else {
+        setSessionId(res.session_id)
+        setPasswordHint(!!res.password_signin)
+        setChallenge(res.challenge_provider || '')
+        const minutes = Math.max(1, Math.round((res.expires_in || 600) / 60))
+        setSentHint(t('modal.add.code_sent', { email: res.email || trimmed, minutes }))
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('modal.register.submit_failed'))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleVerify = async (spaceId?: string) => {
+    if (!sessionId || (!code.trim() && !spaceId)) return
+    setLoading(true)
+    setError('')
+    try {
+      const res = await verifyEmailLogin({
+        sessionId,
+        code: code.trim(),
+        spaceId,
+        spaceName: spaceId ? '' : spaceName.trim(),
+      })
+      if (res.workspaces && res.error) {
+        setChoices(res.workspaces)
+        setError(res.error)
+      } else if (res.error) {
+        setError(res.error)
+      } else if (res.account) {
+        finish(res.account, res.workspaces?.length || 1)
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : t('modal.register.submit_failed'))
@@ -114,50 +181,117 @@ function AddAccountModal({ onClose, onSuccess }: { onClose: () => void; onSucces
           <button onClick={onClose} className="text-text-muted hover:text-white bg-transparent border-none cursor-pointer text-lg px-1">×</button>
         </div>
 
-        <div className="text-[12px] text-text-secondary mb-4 space-y-1.5">
-          <p>{t('modal.add.subtitle')}</p>
-          <p className="text-text-muted">{t('modal.add.how_to')}</p>
+        <div className="flex gap-1 mb-4 p-1 bg-white/5 rounded-lg">
+          {(['token', 'email'] as const).map(item => (
+            <button
+              key={item}
+              type="button"
+              onClick={() => { setMode(item); setError(''); setResult(null) }}
+              className={`flex-1 py-1.5 rounded-md text-[12px] font-medium cursor-pointer border-none ${mode === item ? 'bg-white text-black' : 'bg-transparent text-text-secondary'}`}
+            >
+              {t(item === 'token' ? 'modal.add.tab_token' : 'modal.add.tab_email')}
+            </button>
+          ))}
         </div>
 
-        <form onSubmit={handleSubmit}>
-          <textarea
-            ref={inputRef}
-            value={token}
-            onChange={e => setToken(e.target.value)}
-            placeholder={t('modal.add.placeholder')}
-            rows={3}
-            className="w-full py-2.5 px-3 bg-transparent border border-white/10 rounded-lg text-[13px] text-text-primary outline-none focus:border-white/30 focus:ring-1 focus:ring-white/10 transition-all placeholder:text-white/25 resize-none font-mono"
-          />
-          {error && (
-            <div className="text-err text-[12px] mt-2 px-1">{error}</div>
-          )}
-          {result && (
-            <div className="mt-3 p-3 bg-[#0a3d0a]/50 border border-[#1b5e20]/50 rounded-lg text-[12px]">
-              <div className="text-[#4ade80] font-medium mb-1.5">{t('modal.add.success')}</div>
-              <div className="space-y-0.5 text-text-secondary">
-                <div>{t('modal.add.user')} <span className="text-white">{result.name}</span> ({result.email})</div>
-                <div>{t('modal.add.space')} <span className="text-white">{result.space}</span> · {result.plan_type}</div>
-                {result.workspaceCount > 1 && <div>{t('modal.add.workspaces', { count: result.workspaceCount })}</div>}
-              </div>
+        {mode === 'token' ? (
+          <>
+            <div className="text-[12px] text-text-secondary mb-4 space-y-1.5">
+              <p>{t('modal.add.subtitle')}</p>
+              <p className="text-text-muted">{t('modal.add.how_to')}</p>
             </div>
-          )}
-          <div className="flex gap-2.5 mt-4">
-            <button
-              type="button"
-              onClick={onClose}
-              className="flex-1 py-2.5 bg-transparent hover:bg-white/5 text-text-secondary rounded-lg text-[13px] font-medium cursor-pointer transition-colors border border-white/10"
-            >
-              {t('common.cancel')}
-            </button>
-            <button
-              type="submit"
-              disabled={loading || !token.trim() || !!result}
-              className="flex-1 py-2.5 bg-white hover:bg-white/90 text-black rounded-lg text-[13px] font-semibold cursor-pointer transition-colors border-none disabled:opacity-40 disabled:cursor-not-allowed"
-            >
-              {loading ? t('modal.add.verifying') : t('actions.add_account')}
-            </button>
-          </div>
-        </form>
+            <form onSubmit={handleSubmit}>
+              <textarea
+                ref={inputRef}
+                value={token}
+                onChange={e => setToken(e.target.value)}
+                placeholder={t('modal.add.placeholder')}
+                rows={3}
+                className="w-full py-2.5 px-3 bg-transparent border border-white/10 rounded-lg text-[13px] text-text-primary outline-none focus:border-white/30 focus:ring-1 focus:ring-white/10 transition-all placeholder:text-white/25 resize-none font-mono"
+              />
+              {error && <div className="text-err text-[12px] mt-2 px-1">{error}</div>}
+              {result && <AddAccountSuccess result={result} />}
+              <div className="flex gap-2.5 mt-4">
+                <button type="button" onClick={onClose} className="flex-1 py-2.5 bg-transparent hover:bg-white/5 text-text-secondary rounded-lg text-[13px] font-medium cursor-pointer transition-colors border border-white/10">{t('common.cancel')}</button>
+                <button type="submit" disabled={loading || !token.trim() || !!result} className="flex-1 py-2.5 bg-white hover:bg-white/90 text-black rounded-lg text-[13px] font-semibold cursor-pointer transition-colors border-none disabled:opacity-40 disabled:cursor-not-allowed">
+                  {loading ? t('modal.add.verifying') : t('actions.add_account')}
+                </button>
+              </div>
+            </form>
+          </>
+        ) : (
+          <>
+            <p className="text-[12px] text-text-secondary mb-4">{t('modal.add.email_subtitle')}</p>
+            <form onSubmit={sessionId ? (e) => { e.preventDefault(); void handleVerify() } : handleSendCode}>
+              <input
+                ref={emailRef}
+                type="email"
+                value={email}
+                onChange={e => setEmail(e.target.value)}
+                placeholder={t('modal.add.email_placeholder')}
+                disabled={!!sessionId}
+                className="w-full py-2.5 px-3 mb-2 bg-transparent border border-white/10 rounded-lg text-[13px] text-text-primary outline-none focus:border-white/30 placeholder:text-white/25 disabled:opacity-60"
+              />
+              {sessionId && (
+                <>
+                  <input
+                    value={code}
+                    onChange={e => setCode(e.target.value)}
+                    placeholder={t('modal.add.code_placeholder')}
+                    className="w-full py-2.5 px-3 mb-2 bg-transparent border border-white/10 rounded-lg text-[13px] text-text-primary outline-none focus:border-white/30 placeholder:text-white/25 font-mono"
+                  />
+                  <input
+                    value={spaceName}
+                    onChange={e => setSpaceName(e.target.value)}
+                    placeholder={t('modal.add.space_placeholder')}
+                    className="w-full py-2.5 px-3 bg-transparent border border-white/10 rounded-lg text-[13px] text-text-primary outline-none focus:border-white/30 placeholder:text-white/25"
+                  />
+                </>
+              )}
+              {sentHint && <div className="text-[12px] text-text-secondary mt-2 px-1">{sentHint}</div>}
+              {passwordHint && <div className="text-[12px] text-text-muted mt-1 px-1">{t('modal.add.password_hint')}</div>}
+              {challenge && <div className="text-[12px] text-text-muted mt-1 px-1">{t('modal.add.challenge_hint', { provider: challenge })}</div>}
+              {error && <div className="text-err text-[12px] mt-2 px-1">{error}</div>}
+              {choices.length > 0 && (
+                <div className="mt-3 space-y-1.5">
+                  <div className="text-[12px] text-text-secondary">{t('modal.add.choose_workspace')}</div>
+                  {choices.map(ws => (
+                    <button
+                      key={ws.space_id}
+                      type="button"
+                      disabled={loading}
+                      onClick={() => void handleVerify(ws.space_id)}
+                      className="w-full text-left py-2 px-3 bg-white/5 hover:bg-white/10 rounded-lg text-[12px] text-white cursor-pointer border border-white/10"
+                    >
+                      {ws.space} <span className="text-text-muted">{t('modal.add.import_one')}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+              {result && <AddAccountSuccess result={result} />}
+              <div className="flex gap-2.5 mt-4">
+                <button type="button" onClick={onClose} className="flex-1 py-2.5 bg-transparent hover:bg-white/5 text-text-secondary rounded-lg text-[13px] font-medium cursor-pointer transition-colors border border-white/10">{t('common.cancel')}</button>
+                <button type="submit" disabled={loading || !!result || (sessionId ? !code.trim() : !email.trim())} className="flex-1 py-2.5 bg-white hover:bg-white/90 text-black rounded-lg text-[13px] font-semibold cursor-pointer transition-colors border-none disabled:opacity-40 disabled:cursor-not-allowed">
+                  {loading ? (sessionId ? t('modal.add.verifying') : t('modal.add.sending_code')) : (sessionId ? t('modal.add.verify_login') : t('modal.add.send_code'))}
+                </button>
+              </div>
+            </form>
+          </>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function AddAccountSuccess({ result }: { result: { name: string; email: string; space: string; plan_type: string; workspaceCount: number } }) {
+  const { t } = useTranslation()
+  return (
+    <div className="mt-3 p-3 bg-[#0a3d0a]/50 border border-[#1b5e20]/50 rounded-lg text-[12px]">
+      <div className="text-[#4ade80] font-medium mb-1.5">{t('modal.add.success')}</div>
+      <div className="space-y-0.5 text-text-secondary">
+        <div>{t('modal.add.user')} <span className="text-white">{result.name}</span> ({result.email})</div>
+        <div>{t('modal.add.space')} <span className="text-white">{result.space}</span> · {result.plan_type}</div>
+        {result.workspaceCount > 1 && <div>{t('modal.add.workspaces', { count: result.workspaceCount })}</div>}
       </div>
     </div>
   )
