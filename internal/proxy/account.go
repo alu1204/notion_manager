@@ -1162,10 +1162,7 @@ func (p *AccountPool) RefreshAll(accountsDir string) {
 		p.mu.RLock()
 		for _, acc := range p.accounts {
 			for _, m := range acc.modelsSnapshot() {
-				normalizedName := normalizeModelName(m.Name)
-				if normalizedName != "" {
-					SetModelID(normalizedName, m.ID)
-				}
+				registerFetchedModel(m.Name, m.ID)
 			}
 		}
 		p.mu.RUnlock()

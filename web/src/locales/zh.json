@@ -72,13 +72,28 @@
   "modal": {
     "add": {
       "title": "添加 Notion 账号",
-      "subtitle": "粘贴你的 token_v2 cookie，系统会自动获取账号信息。",
+      "subtitle": "粘贴你的 token_v2 cookie。系统会导入这个账号下的全部工作组，可在列表里分别打开。",
       "how_to": "获取方式：打开 notion.so → F12 → Application → Cookies → 复制 token_v2 的值",
       "placeholder": "粘贴 token_v2 值...",
       "success": "添加成功",
       "user": "用户:",
       "space": "空间:",
-      "verifying": "正在验证..."
+      "workspaces": "已导入 {{count}} 个工作组，可在账号列表里分别打开。",
+      "verifying": "正在验证...",
+      "tab_token": "token_v2",
+      "tab_email": "邮箱验证码",
+      "email_subtitle": "用 Notion 网页登录的邮箱验证码拿到会话，不用自己复制 Cookie。",
+      "email_placeholder": "Notion 账号邮箱",
+      "space_placeholder": "只导入这个工作组（名称或留空导入全部）",
+      "send_code": "发送验证码",
+      "sending_code": "正在发送...",
+      "code_sent": "验证码已发到 {{email}}。请在 {{minutes}} 分钟内填写。",
+      "code_placeholder": "邮件里的验证码",
+      "verify_login": "验证并导入",
+      "password_hint": "这个账号也设置了密码。如果邮箱里没有验证码，请改用 token_v2。",
+      "challenge_hint": "Notion 返回了人机验证（{{provider}}）。如果收不到验证码，请改用 token_v2。",
+      "choose_workspace": "没有匹配到这个名称。点一个工作组再导入：",
+      "import_one": "导入"
     },
     "register": {
       "title": "批量注册账号",

@@ -72,13 +72,28 @@
   "modal": {
     "add": {
       "title": "Add Notion Account",
-      "subtitle": "Paste your token_v2 cookie, and the system will automatically retrieve account info.",
+      "subtitle": "Paste your token_v2 cookie. Every workspace on this account is imported and can be opened from the list.",
       "how_to": "How to get: Open notion.so → F12 → Application → Cookies → Copy token_v2 value",
       "placeholder": "Paste token_v2 value...",
       "success": "Added successfully",
       "user": "User:",
       "space": "Space:",
-      "verifying": "Verifying..."
+      "workspaces": "Imported {{count}} workspaces. Open each one from the account list.",
+      "verifying": "Verifying...",
+      "tab_token": "token_v2",
+      "tab_email": "Email code",
+      "email_subtitle": "Sign in with the code Notion emails you. No need to copy the cookie.",
+      "email_placeholder": "Notion account email",
+      "space_placeholder": "Import only this workspace name, or leave empty for all",
+      "send_code": "Send code",
+      "sending_code": "Sending...",
+      "code_sent": "Code sent to {{email}}. Enter it within {{minutes}} minutes.",
+      "code_placeholder": "Code from the email",
+      "verify_login": "Verify and import",
+      "password_hint": "This account also has a password. If no code arrives, use token_v2 instead.",
+      "challenge_hint": "Notion asked for a bot check ({{provider}}). If no code arrives, use token_v2.",
+      "choose_workspace": "No workspace matched that name. Pick one to import:",
+      "import_one": "Import"
     },
     "register": {
       "title": "Bulk Register Accounts",

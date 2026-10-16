@@ -38,9 +38,9 @@ proxy:
     # Notion API base URL
     notion_api_base: "https://www.notion.so/api/v3"
     # Notion client version sent in headers
-    client_version: "23.13.20260313.1423"
+    client_version: "23.13.20261016.0235"
     # Default model when none specified in request
-    default_model: "opus-4.6"
+    default_model: "opus-5"
     # Disable Notion's built-in system prompt (~33k tokens).
     # When true, removes Notion AI identity, built-in tools, and web search.
     # Reduces input tokens from ~33k to ~757. Recommended for pure API proxy usage.
@@ -100,11 +100,31 @@ browser:
 # Model alias mapping: friendly name → Notion internal model ID
 # These are overwritten at runtime when models are fetched from Notion API.
 model_map:
+    opus-5: "agave-flan"
+    opus-4.8: "ambrosia-tart-high"
+    opus-4.7: "apricot-sorbet-high"
     opus-4.6: "avocado-froyo-medium"
+    sonnet-5: "angel-cake-high"
     sonnet-4.6: "almond-croissant-low"
     haiku-4.5: "anthropic-haiku-4.5"
-    gpt-5.2: "oatmeal-cookie"
+    fable-5: "acai-budino-high"
+    gpt-5.6-sol: "orange-mousse"
+    gpt-5.6-terra: "orchid-muffin"
+    gpt-5.6-luna: "olive-jellyroll"
+    gpt-5.5: "opal-quince-medium"
     gpt-5.4: "oval-kumquat-medium"
-    gemini-2.5-flash: "vertex-gemini-2.5-flash"
+    gpt-5.4-mini: "oregon-grape-medium"
+    gpt-5.4-nano: "otaheite-apple-medium"
+    gpt-5.2: "oatmeal-cookie"
+    gemini-3.5-flash: "vertex-gemini-3.5-flash"
+    gemini-3.1-pro: "galette-medium-thinking"
     gemini-3-flash: "gingerbread"
+    gemini-2.5-flash: "vertex-gemini-2.5-flash"
+    grok-4.3: "xigua-mochi-medium"
+    grok-build-0.1: "xinomavro-cake"
+    kimi-k2.7: "fireworks-kimi-k2.7"
+    kimi-k2.6: "fireworks-kimi-k2.6"
+    deepseek-v4-pro: "baseten-deepseek-v4-pro"
+    glm-5.2: "baseten-glm-5.2"
+    spacexai-4.5: "strawberry-whoopiepie"
     minimax-m2.5: "fireworks-minimax-m2.5"

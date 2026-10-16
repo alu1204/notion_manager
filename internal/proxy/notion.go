@@ -22,6 +22,8 @@ import (
 
 	"github.com/andybalholm/brotli"
 	"github.com/klauspost/compress/zstd"
+
+	"notion-manager/internal/notionapi"
 )
 
 // ErrQuotaExhausted is returned when an account's AI usage limit is exceeded
@@ -41,19 +43,47 @@ var ErrEmptyResponse = errors.New("empty response from inference")
 
 var (
 	NotionAPIBase        = "https://www.notion.so/api/v3"
-	DefaultClientVersion = "23.13.20260313.1423"
+	DefaultClientVersion = "23.13.20261016.0235"
 )
 
-var DefaultModelMap = map[string]string{
-	"opus-4.6":         "avocado-froyo-medium",
-	"sonnet-4.6":       "almond-croissant-low",
-	"haiku-4.5":        "anthropic-haiku-4.5",
-	"gpt-5.2":          "oatmeal-cookie",
-	"gpt-5.4":          "oval-kumquat-medium",
-	"gemini-2.5-flash": "vertex-gemini-2.5-flash",
-	"gemini-3-flash":   "gingerbread",
-	"minimax-m2.5":     "fireworks-minimax-m2.5",
+// builtinModelMap is the fallback alias table used before a live
+// getAvailableModels response replaces it. Internal ids were checked
+// against public Notion-compatible registries that mirror the current
+// dessert codenames (Opus 5, Sonnet 5, GPT-5.6, Gemini 3.5, …).
+func builtinModelMap() map[string]string {
+	return map[string]string{
+		"opus-5":           "agave-flan",
+		"opus-4.8":         "ambrosia-tart-high",
+		"opus-4.7":         "apricot-sorbet-high",
+		"opus-4.6":         "avocado-froyo-medium",
+		"sonnet-5":         "angel-cake-high",
+		"sonnet-4.6":       "almond-croissant-low",
+		"haiku-4.5":        "anthropic-haiku-4.5",
+		"fable-5":          "acai-budino-high",
+		"gpt-5.6-sol":      "orange-mousse",
+		"gpt-5.6-terra":    "orchid-muffin",
+		"gpt-5.6-luna":     "olive-jellyroll",
+		"gpt-5.5":          "opal-quince-medium",
+		"gpt-5.4":          "oval-kumquat-medium",
+		"gpt-5.4-mini":     "oregon-grape-medium",
+		"gpt-5.4-nano":     "otaheite-apple-medium",
+		"gpt-5.2":          "oatmeal-cookie",
+		"gemini-3.5-flash": "vertex-gemini-3.5-flash",
+		"gemini-3.1-pro":   "galette-medium-thinking",
+		"gemini-3-flash":   "gingerbread",
+		"gemini-2.5-flash": "vertex-gemini-2.5-flash",
+		"grok-4.3":         "xigua-mochi-medium",
+		"grok-build-0.1":   "xinomavro-cake",
+		"kimi-k2.7":        "fireworks-kimi-k2.7",
+		"kimi-k2.6":        "fireworks-kimi-k2.6",
+		"deepseek-v4-pro":  "baseten-deepseek-v4-pro",
+		"glm-5.2":          "baseten-glm-5.2",
+		"spacexai-4.5":     "strawberry-whoopiepie",
+		"minimax-m2.5":     "fireworks-minimax-m2.5",
+	}
 }
+
+var DefaultModelMap = builtinModelMap()
 
 var modelMapMu sync.RWMutex
 
@@ -102,16 +132,23 @@ func ApplyConfig(cfg *Config) {
 	SetNotionResponseLoggingEnabled(cfg.Server.NotionLogResp)
 }
 
-// anthropicModelAliases maps Anthropic SDK model names to our friendly aliases
+// anthropicModelAliases maps Anthropic SDK model names to our friendly aliases.
+// Older dated snapshots point at the newest alias in that family that the
+// builtin map still knows; ResolveModel then fuzzy-matches whatever the live
+// catalog actually registered.
 var anthropicModelAliases = map[string]string{
+	"claude-opus-5":     "opus-5",
+	"claude-opus-4-8":   "opus-4.8",
+	"claude-opus-4-7":   "opus-4.7",
 	"claude-opus-4-6":   "opus-4.6",
-	"claude-opus-4-5":   "opus-4.6", // older version → best available opus
+	"claude-opus-4-5":   "opus-5",
+	"claude-opus-4":     "opus-5",
+	"claude-sonnet-5":   "sonnet-5",
 	"claude-sonnet-4-6": "sonnet-4.6",
+	"claude-sonnet-4-5": "sonnet-5",
+	"claude-sonnet-4":   "sonnet-5",
 	"claude-haiku-4-5":  "haiku-4.5",
-	"claude-sonnet-4-5": "sonnet-4.5",
-	"claude-opus-4":     "opus-4",
-	"claude-sonnet-4":   "sonnet-4",
-	"claude-haiku-3-5":  "haiku-3.5",
+	"claude-haiku-3-5":  "haiku-4.5",
 }
 
 // ResolveModel maps OpenAI/Anthropic model name → Notion internal model name
@@ -139,26 +176,115 @@ func ResolveModel(model string) string {
 			}
 		}
 	}
-	// Fuzzy fallback: map unrecognized models by family keyword
+	// Fuzzy fallback: map unrecognized models onto the newest registered
+	// alias in that family, not a stale hardcoded generation.
 	lower := strings.ToLower(model)
 	switch {
 	case strings.Contains(lower, "opus"):
-		if id, ok := snap["opus-4.6"]; ok {
-			log.Printf("[model] fuzzy fallback %q → opus-4.6", model)
+		if alias, id, ok := latestFamilyModel(snap, "opus"); ok {
+			log.Printf("[model] fuzzy fallback %q → %s", model, alias)
 			return id
 		}
 	case strings.Contains(lower, "sonnet"):
-		if id, ok := snap["sonnet-4.6"]; ok {
-			log.Printf("[model] fuzzy fallback %q → sonnet-4.6", model)
+		if alias, id, ok := latestFamilyModel(snap, "sonnet"); ok {
+			log.Printf("[model] fuzzy fallback %q → %s", model, alias)
 			return id
 		}
 	case strings.Contains(lower, "haiku"):
-		if id, ok := snap["haiku-4.5"]; ok {
-			log.Printf("[model] fuzzy fallback %q → haiku-4.5", model)
+		if alias, id, ok := latestFamilyModel(snap, "haiku"); ok {
+			log.Printf("[model] fuzzy fallback %q → %s", model, alias)
 			return id
 		}
 	}
 	return model
+}
+
+// latestFamilyModel picks the highest dotted version among aliases such as
+// opus-4.6 / opus-4.8 / opus-5. Non-version aliases are ignored.
+func latestFamilyModel(snap map[string]string, family string) (alias string, id string, ok bool) {
+	prefix := family + "-"
+	bestRank := []int(nil)
+	for name, internal := range snap {
+		if internal == "" || !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		rank := versionRank(name[len(prefix):])
+		if len(rank) == 0 {
+			continue
+		}
+		if bestRank == nil || compareRank(rank, bestRank) > 0 {
+			bestRank = rank
+			alias = name
+			id = internal
+			ok = true
+		}
+	}
+	return alias, id, ok
+}
+
+func versionRank(s string) []int {
+	var rank []int
+	n := -1
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			if n < 0 {
+				n = 0
+			}
+			n = n*10 + int(r-'0')
+			continue
+		}
+		if n >= 0 {
+			rank = append(rank, n)
+			n = -1
+		}
+	}
+	if n >= 0 {
+		rank = append(rank, n)
+	}
+	return rank
+}
+
+func compareRank(a, b []int) int {
+	n := len(a)
+	if len(b) > n {
+		n = len(b)
+	}
+	for i := 0; i < n; i++ {
+		av, bv := 0, 0
+		if i < len(a) {
+			av = a[i]
+		}
+		if i < len(b) {
+			bv = b[i]
+		}
+		if av != bv {
+			return av - bv
+		}
+	}
+	return 0
+}
+
+// registerFetchedModel publishes a live Notion model under the normalized
+// display name and under the builtin aliases that share its internal id.
+func registerFetchedModel(displayName, id string) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return
+	}
+	if alias := normalizeModelName(displayName); alias != "" {
+		SetModelID(alias, id)
+	}
+	for friendly, internal := range builtinModelMap() {
+		if internal != id {
+			continue
+		}
+		SetModelID(friendly, id)
+		for anthropic, short := range anthropicModelAliases {
+			if short == friendly {
+				SetModelID(anthropic, id)
+			}
+		}
+	}
 }
 
 // StreamCallback is called for each text delta during streaming
@@ -1796,23 +1922,14 @@ func FetchModels(acc *Account) ([]ModelEntry, error) {
 		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(respBody[:min(len(respBody), 300)]))
 	}
 
-	var result struct {
-		Models []struct {
-			Model        string `json:"model"`
-			ModelMessage string `json:"modelMessage"`
-			ModelFamily  string `json:"modelFamily"`
-			IsDisabled   bool   `json:"isDisabled"`
-		} `json:"models"`
-	}
-	if err := json.Unmarshal(respBody, &result); err != nil {
+	parsed, err := notionapi.ParseAvailableModels(respBody)
+	if err != nil {
 		return nil, fmt.Errorf("parse response: %w", err)
 	}
 
 	var models []ModelEntry
-	for _, m := range result.Models {
-		if !m.IsDisabled {
-			models = append(models, ModelEntry{ID: m.Model, Name: m.ModelMessage})
-		}
+	for _, m := range parsed {
+		models = append(models, ModelEntry{ID: m.ID, Name: m.Name})
 	}
 	return models, nil
 }
@@ -1934,69 +2051,62 @@ func CheckQuota(acc *Account) (*QuotaInfo, error) {
 	return info, nil
 }
 
-// CheckUserWorkspace probes /api/v3/loadUserContent and returns the number
-// of accessible workspaces (`user_root.space_views` length) for this
-// account.
+// workspaceHTTPClient is the HTTP client used by CheckUserWorkspace.
+// Tests replace it; production uses the Chrome-fingerprinted client.
+var workspaceHTTPClient = getChromeHTTPClient
+
+// CheckUserWorkspace returns how many workspaces this account can open.
+//
+// The current web client loads spaces through getSpacesInitial plus
+// getSpacesFanout. loadUserContent and the older getSpaces body are still
+// accepted. space_view_pointers and the legacy space_views array both
+// count, including the v3 value/role nesting.
 //
 // Background: when an account's Notion onboarding never completed (or the
 // workspace was reaped), Notion still returns a user_root record but with
-// no `space_views` field. The /ai SPA then loops on a skeleton screen
-// because `someSpace.getSpaceId()` runs against `undefined`. Probing this
-// up-front lets the pool blacklist such accounts so the dashboard's
-// "best account" selector and the per-email click never lands on them.
+// no space pointers. The /ai SPA then loops on a skeleton screen because
+// someSpace.getSpaceId() runs against undefined. Probing this up-front lets
+// the pool blacklist such accounts so the dashboard's "best account"
+// selector and the per-email click never lands on them.
 //
 // 0 with err==nil is a real, sticky signal — not a transient. Callers
 // should persist the result so a restart doesn't have to re-probe every
-// account.
+// account. When the account's user id is present, the count is strict.
+// When the id is absent, any non-empty user keeps a healthy account.
 func CheckUserWorkspace(acc *Account) (int, error) {
-	body := []byte(`{}`)
-	req, err := http.NewRequest("POST", NotionAPIBase+"/loadUserContent", bytes.NewReader(body))
-	if err != nil {
-		return 0, fmt.Errorf("create request: %w", err)
-	}
-	setNotionHeadersJSON(req, acc)
-
-	client := getChromeHTTPClient(AppConfig.APITimeoutDuration())
-	resp, err := client.Do(req)
+	client := workspaceHTTPClient(AppConfig.APITimeoutDuration())
+	var lastStatus int
+	var lastBody []byte
+	cat, err := notionapi.FetchCatalog(func(endpoint string, body []byte, headers map[string]string) (int, []byte, error) {
+		req, reqErr := http.NewRequest("POST", NotionAPIBase+"/"+endpoint, bytes.NewReader(body))
+		if reqErr != nil {
+			return 0, nil, reqErr
+		}
+		setNotionHeadersJSON(req, acc)
+		for key, value := range headers {
+			if key != "" && value != "" {
+				req.Header.Set(key, value)
+			}
+		}
+		resp, doErr := client.Do(req)
+		if doErr != nil {
+			return 0, nil, doErr
+		}
+		defer resp.Body.Close()
+		respBody, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusOK {
+			lastStatus = resp.StatusCode
+			lastBody = respBody
+		}
+		return resp.StatusCode, respBody, nil
+	})
 	if err != nil {
 		return 0, fmt.Errorf("send request: %w", err)
 	}
-	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 200 {
-		return 0, fmt.Errorf("API error %d: %s", resp.StatusCode, string(respBody[:min(len(respBody), 300)]))
+	if len(cat.Users) == 0 && lastStatus != 0 {
+		return 0, fmt.Errorf("API error %d: %s", lastStatus, string(lastBody[:min(len(lastBody), 300)]))
 	}
-
-	// We only care about user_root.{userId}.value.value.space_views; using
-	// json.RawMessage keeps us tolerant to schema drift on every other
-	// field.
-	var parsed struct {
-		RecordMap struct {
-			UserRoot map[string]struct {
-				Value struct {
-					Value struct {
-						SpaceViews []string `json:"space_views"`
-					} `json:"value"`
-				} `json:"value"`
-			} `json:"user_root"`
-		} `json:"recordMap"`
-	}
-	if err := json.Unmarshal(respBody, &parsed); err != nil {
-		return 0, fmt.Errorf("parse response: %w", err)
-	}
-	// Prefer the user_root keyed by this account's UserID. If Notion ever
-	// switches to a different keying we still fall back to "any non-empty
-	// space_views in the response" so a transient mismatch doesn't false-
-	// positive an otherwise healthy account.
-	if entry, ok := parsed.RecordMap.UserRoot[acc.UserID]; ok {
-		return len(entry.Value.Value.SpaceViews), nil
-	}
-	for _, entry := range parsed.RecordMap.UserRoot {
-		if n := len(entry.Value.Value.SpaceViews); n > 0 {
-			return n, nil
-		}
-	}
-	return 0, nil
+	return cat.ProbeCount(acc.UserID), nil
 }
 
 func decompressBody(resp *http.Response) (io.Reader, func(), error) {
@@ -2465,8 +2575,10 @@ func parseNDJSONStream(reader io.Reader, requestID string, cb StreamCallback, na
 	}
 	agentThinking := make(map[string]*agentThinkingState)
 	searchToolStates := make(map[string]*searchToolState)
-	// Deduplicate native tool_use forwarding across cumulative agent-inference events.
-	seenNativeToolUseIDs := make(map[string]bool)
+	// Merge native tool_use by id. The first event is often callFunction with
+	// an empty input; the real name and arguments arrive later.
+	toolAcc := &nativeToolAccumulator{}
+	patchToolIDs := make(map[string]string)
 	// toolCallId -> ordered web result URLs (for resolving [^toolu_*] citations).
 	toolCallSearchURLs := make(map[string][]string)
 	if knownToolCallURLs != nil {
@@ -2553,11 +2665,9 @@ func parseNDJSONStream(reader io.Reader, requestID string, cb StreamCallback, na
 			}
 		case "tool_use":
 			// Skip — tool state must not pollute text output.
-			if entry.Name != "" && entry.ID != "" && !seenNativeToolUseIDs[entry.ID] {
-				seenNativeToolUseIDs[entry.ID] = true
-				if nativeToolUses != nil {
-					*nativeToolUses = append(*nativeToolUses, entry)
-				}
+			if entry.ID != "" {
+				patchToolIDs[fmt.Sprintf("%s/value/%d", statePrefix, index)] = entry.ID
+				toolAcc.upsert(entry)
 			}
 		}
 	}
@@ -2581,6 +2691,7 @@ func parseNDJSONStream(reader io.Reader, requestID string, cb StreamCallback, na
 			return ErrPremiumFeatureUnavailable
 
 		case "agent-tool-result":
+			noteAgentToolResult(toolAcc, line)
 			var toolEvt searchToolResultEvent
 			if err := json.Unmarshal([]byte(line), &toolEvt); err != nil {
 				continue
@@ -2772,11 +2883,8 @@ func parseNDJSONStream(reader io.Reader, requestID string, cb StreamCallback, na
 							}
 						}
 					}
-					if entry.Name != "" && entry.ID != "" && !seenNativeToolUseIDs[entry.ID] {
-						seenNativeToolUseIDs[entry.ID] = true
-						if nativeToolUses != nil {
-							*nativeToolUses = append(*nativeToolUses, entry)
-						}
+					if entry.ID != "" {
+						toolAcc.upsert(entry)
 					}
 				}
 			}
@@ -2887,6 +2995,14 @@ func parseNDJSONStream(reader io.Reader, requestID string, cb StreamCallback, na
 					continue
 				}
 
+				if strings.HasSuffix(op.P, "/input") {
+					prefix := strings.TrimSuffix(op.P, "/input")
+					if id := patchToolIDs[prefix]; id != "" {
+						toolAcc.mergeInput(id, op.V)
+					}
+					continue
+				}
+
 				if !strings.Contains(op.P, "content") {
 					continue
 				}
@@ -2939,12 +3055,15 @@ func parseNDJSONStream(reader io.Reader, requestID string, cb StreamCallback, na
 	}
 
 	closeThinking()
+	if nativeToolUses != nil {
+		*nativeToolUses = toolAcc.snapshot()
+	}
 	LogNotionResponseJSON(requestID, "runInferenceTranscript stream summary", map[string]interface{}{
 		"line_count":            lineCount,
 		"event_type_counts":     eventTypeCounts,
 		"clean_text_chars":      len(sentClean),
 		"thinking_chars":        emittedThinkingChars,
-		"native_tool_use_count": len(seenNativeToolUseIDs),
+		"native_tool_use_count": len(toolAcc.order),
 		"search_result_sets":    len(toolCallSearchURLs),
 		"usage":                 totalUsage,
 	})

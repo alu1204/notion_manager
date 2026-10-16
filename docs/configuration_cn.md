@@ -30,8 +30,8 @@
 | 配置项 | 仓库样例 | 代码默认 | 说明 |
 | --- | --- | --- | --- |
 | `proxy.notion_api_base` | `https://www.notion.so/api/v3` | 同左 | Notion API 入口 |
-| `proxy.client_version` | `23.13.20260313.1423` | 同左 | `x-notion-client-version` 请求头 |
-| `proxy.default_model` | `opus-4.6` | `opus-4.6` | 请求未传 `model` 时的回退 |
+| `proxy.client_version` | `23.13.20261016.0235` | 同左 | `x-notion-client-version` 请求头 |
+| `proxy.default_model` | `opus-5` | `opus-5` | 请求未传 `model` 时的回退 |
 | `proxy.disable_notion_prompt` | `true` | `false` | 关闭 Notion 内置 ~33k 系统提示，节省输入 token |
 | `proxy.enable_web_search` | `true` | `true` | 联网搜索全局开关（可被请求头覆盖） |
 | `proxy.enable_workspace_search` | `false` | `false` | 工作区搜索全局开关（可被请求头覆盖） |

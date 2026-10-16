@@ -225,6 +225,72 @@ export interface AddAccountResult {
     space: string
     plan_type: string
   }
+  workspaces?: {
+    name: string
+    email: string
+    space: string
+    space_id: string
+    plan_type: string
+  }[]
+}
+
+export interface EmailLoginStartResult {
+  status?: string
+  error?: string
+  session_id?: string
+  email?: string
+  expires_in?: number
+  password_signin?: boolean
+  has_account?: boolean
+  challenge_provider?: string
+}
+
+export interface EmailWorkspace {
+  name: string
+  email: string
+  space: string
+  space_id: string
+  plan_type: string
+  filename?: string
+}
+
+export interface EmailLoginVerifyResult extends AddAccountResult {
+  session_id?: string
+  workspaces?: EmailWorkspace[]
+}
+
+export async function startEmailLogin(email: string): Promise<EmailLoginStartResult> {
+  const resp = await fetch('/admin/accounts/email/start', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    credentials: 'same-origin',
+    body: JSON.stringify({ email }),
+  })
+  const data = await readJson<EmailLoginStartResult>(resp, '发送验证码接口返回了无效响应')
+  if (!resp.ok) return { error: data.error || `HTTP ${resp.status}` }
+  return data
+}
+
+export async function verifyEmailLogin(input: {
+  sessionId: string
+  code?: string
+  spaceId?: string
+  spaceName?: string
+}): Promise<EmailLoginVerifyResult> {
+  const resp = await fetch('/admin/accounts/email/verify', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    credentials: 'same-origin',
+    body: JSON.stringify({
+      session_id: input.sessionId,
+      code: input.code || '',
+      space_id: input.spaceId || '',
+      space_name: input.spaceName || '',
+    }),
+  })
+  const data = await readJson<EmailLoginVerifyResult>(resp, '验证码登录接口返回了无效响应')
+  if (!resp.ok) return { ...data, error: data.error || `HTTP ${resp.status}` }
+  return data
 }
 
 export async function addAccount(tokenV2: string): Promise<AddAccountResult> {
